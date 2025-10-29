@@ -9,3 +9,12 @@ plugins
 GPATH
 GRTAGS
 GTAGS
+ebin/
+escript/
+escript.lock
+sbin/
+sbin.lock
+plugins.lock
+rabbitmq_message_deduplication.d
+test_data/
+test_khepri_store/

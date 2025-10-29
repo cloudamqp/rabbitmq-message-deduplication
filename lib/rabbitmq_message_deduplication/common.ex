@@ -59,7 +59,7 @@ defmodule RabbitMQMessageDeduplication.Common do
 	# which returned :undefined instead of nil or :void. We have to
 	# keep this value as this is used in keys to cache the message
 	# and is preserved during a rolling upgrade in a replicated
-	# Mnesia table
+	# Khepri store
 	:undefined
       :undefined -> nil
     end

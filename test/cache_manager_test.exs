@@ -9,7 +9,6 @@ defmodule RabbitMQMessageDeduplication.CacheManager.Test do
   use ExUnit.Case
 
   alias :timer, as: Timer
-  alias :mnesia, as: Mnesia
   alias RabbitMQMessageDeduplication.Cache, as: Cache
   alias RabbitMQMessageDeduplication.CacheManager, as: CacheManager
 
@@ -26,7 +25,11 @@ defmodule RabbitMQMessageDeduplication.CacheManager.Test do
     options = [persistence: :memory]
 
     CacheManager.create(:cache, true, options)
-    {:atomic, [:cache]} = Mnesia.transaction(fn -> Mnesia.all_keys(caches()) end)
+
+    # Verify cache exists by checking info
+    info = Cache.info(:cache)
+    assert Keyword.has_key?(info, :entries)
+
     CacheManager.destroy(:cache)
   end
 
@@ -34,9 +37,15 @@ defmodule RabbitMQMessageDeduplication.CacheManager.Test do
     options = [persistence: :memory]
 
     :ok = CacheManager.create(:cache, false, options)
-    {:atomic, [:cache]} = Mnesia.transaction(fn -> Mnesia.all_keys(caches()) end)
+
+    # Verify cache exists
+    info = Cache.info(:cache)
+    assert Keyword.has_key?(info, :entries)
+
     :ok = CacheManager.destroy(:cache)
-    {:atomic, []} = Mnesia.transaction(fn -> Mnesia.all_keys(caches()) end)
+
+    # Verify cache is deleted
+    assert Cache.info(:cache) == []
   end
 
   test "cache cleanup routine", %{} do
@@ -48,7 +57,8 @@ defmodule RabbitMQMessageDeduplication.CacheManager.Test do
 
     Timer.sleep(3200)
 
-    {:atomic, []} = Mnesia.transaction(fn -> Mnesia.all_keys(:cache) end)
+    # Verify cache is empty after cleanup
+    [entries: 0, bytes: _, nodes: _] = Cache.info(:cache)
     {:ok, :inserted} = Cache.insert(:cache, "foo")
 
     :ok = CacheManager.destroy(:cache)

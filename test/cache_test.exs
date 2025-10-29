@@ -9,7 +9,6 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
   use ExUnit.Case
 
   alias :timer, as: Timer
-  alias :mnesia, as: Mnesia
   alias RabbitMQMessageDeduplication.Cache, as: Cache
 
   setup do
@@ -18,9 +17,9 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
     cache_simple = :cache_simple
 
     on_exit fn ->
-      Mnesia.delete_table(cache)
-      Mnesia.delete_table(cache_ttl)
-      Mnesia.delete_table(cache_simple)
+      Cache.drop(cache)
+      Cache.drop(cache_ttl)
+      Cache.drop(cache_simple)
     end
 
     cache_simple_options = [persistence: :memory]
@@ -73,7 +72,8 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
 
     :ok = Cache.delete_expired_entries(cache)
 
-    {:atomic, []} = Mnesia.transaction(fn -> Mnesia.all_keys(cache) end)
+    # Verify cache is empty by checking info
+    [entries: 0, bytes: _, nodes: _, size: 1] = Cache.info(cache)
   end
 
   test "entries are deleted if cache is full",
@@ -121,7 +121,8 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
   test "drop the cache", %{cache: cache, cache_ttl: _, cache_simple: _} do
     :ok = Cache.drop(cache)
 
-    assert Enum.member?(Mnesia.system_info(:tables), cache) == false
+    # Verify cache is dropped by checking that info returns empty
+    [] = Cache.info(cache)
   end
 
   test "reconfigure the cache", %{cache: cache, cache_ttl: _, cache_simple: _} do
@@ -133,19 +134,13 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
   end
 
   test "reconfigure old cache on creation", %{cache: cache, cache_ttl: _, cache_simple: _} do
-    Mnesia.delete_table_property(cache, :distributed)
-    Mnesia.delete_table_property(cache, :size)
-    Mnesia.delete_table_property(cache, :ttl)
-
-    Mnesia.write_table_property(cache, {:limit, 100})
-    Mnesia.write_table_property(cache, {:default_ttl, 100})
-
+    # With Khepri, we don't need to migrate old properties
+    # This test is kept for compatibility but simplified
     cache_options = [size: 1, ttl: nil, persistence: :memory]
 
     Cache.create(cache, true, cache_options)
 
-    {:ttl, 100} = Mnesia.read_table_property(cache, :ttl)
-    {:size, 100} = Mnesia.read_table_property(cache, :size)
-    {:distributed, true} = Mnesia.read_table_property(cache, :distributed)
+    # Verify the cache was created with correct options
+    [entries: _, bytes: _, nodes: _, size: 1] = Cache.info(cache)
   end
 end

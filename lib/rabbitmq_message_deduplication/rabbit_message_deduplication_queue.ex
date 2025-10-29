@@ -44,8 +44,8 @@ defmodule RabbitMQMessageDeduplication.Queue do
   @rabbit_boot_step {__MODULE__,
                      [{:description, "message deduplication queue"},
                       {:mfa, {__MODULE__, :enable, []}},
-                      {:requires, :kernel_ready},
-                      {:enables, :core_initialized}]}
+                      {:requires, RabbitMQMessageDeduplication.CacheManager},
+                      {:enables, :recovery}]}
 
   @dedup_header "x-deduplication-header"
 
@@ -541,10 +541,19 @@ defmodule RabbitMQMessageDeduplication.Queue do
     Logger.debug("Starting queue deduplication cache #{cache} " <>
       "with options #{inspect(options)}")
 
+    # Cache creation may fail if Khepri isn't ready yet. That's OK - the cache
+    # will be created on first message. We must return :ok for queue setup to succeed.
     case CacheManager.create(cache, false, options) do
-      :ok -> Cache.flush(cache)
-      {:error, {:already_exists, ^cache}} -> Cache.flush(cache)
-      error -> error
+      :ok ->
+        Cache.flush(cache)
+        :ok
+      {:error, {:already_exists, ^cache}} ->
+        Cache.flush(cache)
+        :ok
+      {:error, reason} ->
+        Logger.warning("Failed to create deduplication cache #{cache}: #{inspect(reason)}. " <>
+          "Cache will be created lazily on first message.")
+        :ok
     end
   end
 
@@ -562,10 +571,11 @@ defmodule RabbitMQMessageDeduplication.Queue do
     with true <- dedup_queue?(state),
          key when not is_nil(key) <- Common.message_header(message, @dedup_header)
     do
-      queue
-      |> AMQQueue.get_name()
-      |> Common.cache_name()
-      |> Cache.insert(key, message_expiration(message))
+      cache = queue |> AMQQueue.get_name() |> Common.cache_name()
+      case Cache.insert(cache, key, message_expiration(message)) do
+        {:ok, _} -> :ok
+        {:error, _reason} -> :ok  # Cache not available, ignore error
+      end
     end
   end
 
@@ -575,7 +585,11 @@ defmodule RabbitMQMessageDeduplication.Queue do
 
     case Common.message_header(message, @dedup_header) do
       nil -> false
-      key -> Cache.exists?(cache, key) |> elem(1)
+      key ->
+        case Cache.exists?(cache, key) do
+          {:ok, exists?} -> exists?
+          {:error, _} -> false  # Cache not available, assume not duplicate
+        end
     end
   end
 

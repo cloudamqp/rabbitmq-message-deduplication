@@ -4,7 +4,7 @@ RABBITMQ_VERSION ?= v4.1.x
 current_rmq_ref = $(RABBITMQ_VERSION)
 
 # The Application needs to depend on `rabbit` in order to be detected as a plugin.
-DEPS = rabbit
+DEPS = rabbit rabbit_common khepri
 TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers amqp_client
 
 DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk

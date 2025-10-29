@@ -47,8 +47,8 @@ defmodule RabbitMQMessageDeduplication.Exchange do
   @rabbit_boot_step {__MODULE__,
                      [{:description, "exchange type x-message-deduplication"},
                       {:mfa, {__MODULE__, :register, []}},
-                      {:requires, :rabbit_registry},
-                      {:enables, :kernel_ready}]}
+                      {:requires, :kernel_ready},
+                      {:enables, RabbitMQMessageDeduplication.CacheManager}]}
 
   defrecord :exchange, extract(
     :exchange, from_lib: "rabbit_common/include/rabbit.hrl")
@@ -94,8 +94,13 @@ defmodule RabbitMQMessageDeduplication.Exchange do
 
   @impl :rabbit_exchange_type
   def validate(exchange(arguments: args)) do
+    require Logger
+
     case List.keyfind(args, "x-cache-size", 0) do
-      {"x-cache-size", _, val} when is_integer(val) and val > 0 -> :ok
+      {"x-cache-size", type, val} when type in [:short, :long, :signedint, :unsignedint] and is_integer(val) and val > 0 ->
+        :ok
+      {"x-cache-size", _, val} when is_integer(val) and val > 0 ->
+        :ok
       {"x-cache-size", :longstr, val} ->
         case Integer.parse(val, 10) do
           :error -> RabbitMisc.protocol_error(
@@ -104,7 +109,7 @@ defmodule RabbitMQMessageDeduplication.Exchange do
                       'x-cache-size' must be an integer greater than 0", [])
           _ -> :ok
         end
-      _ ->
+      found ->
         RabbitMisc.protocol_error(
           :precondition_failed,
           "Missing or invalid argument, \
@@ -152,12 +157,23 @@ defmodule RabbitMQMessageDeduplication.Exchange do
     Logger.debug("Starting exchange deduplication cache #{cache} " <>
       "with options #{inspect(options)}")
 
-    CacheManager.create(cache, true, options)
+    # Create the cache in Khepri. If this fails, the exchange creation will fail.
+    # Khepri should be ready at this point in the boot sequence.
+    case CacheManager.create(cache, true, options) do
+      :ok ->
+        :ok
+      {:error, reason} ->
+        Logger.error("Failed to create deduplication cache #{cache}: #{inspect(reason)}")
+        {:error, reason}
+    end
   end
 
   @impl :rabbit_exchange_type
   def delete(_sr, exchange(name: name)) do
-    name |> Common.cache_name() |> CacheManager.destroy()
+    case name |> Common.cache_name() |> CacheManager.destroy() do
+      :ok -> :ok
+      {:error, _} -> :ok  # CacheManager not available, that's OK
+    end
   end
 
   def delete(_tx, exchange, _bs), do: delete(:none, exchange)
@@ -230,7 +246,33 @@ defmodule RabbitMQMessageDeduplication.Exchange do
       key -> case Cache.insert(cache, key, ttl) do
                {:ok, :exists} -> false
                {:ok, :inserted} -> true
+               {:ok, {:error, reason}} ->
+                 # Cache operation failed, create cache and retry
+                 create_cache_if_needed(exchange_name)
+                 # For now, allow the message through to avoid blocking
+                 # TODO: Could retry the insert after cache creation
+                 true
+               {:error, reason} ->
+                 # Khepri not available, create cache for when it becomes ready
+                 create_cache_if_needed(exchange_name)
+                 true
              end
+    end
+  end
+
+  defp create_cache_if_needed(exchange_name) do
+    require Logger
+    cache = Common.cache_name(exchange_name)
+
+    # Try to get exchange to extract options
+    case :rabbit_exchange.lookup(exchange_name) do
+      {:ok, exchange(arguments: args)} ->
+        options = format_options(args)
+        Logger.debug("Attempting lazy cache creation for #{cache}")
+        CacheManager.create(cache, true, options)
+      _ ->
+        Logger.warning("Cannot create cache #{cache}: exchange not found")
+        {:error, :exchange_not_found}
     end
   end
 

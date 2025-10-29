@@ -15,7 +15,6 @@ defmodule RabbitMQMessageDeduplication.CacheManager do
   require RabbitMQMessageDeduplication.Cache
 
   alias :timer, as: Timer
-  alias :mnesia, as: Mnesia
   alias RabbitMQMessageDeduplication.Cache, as: Cache
   alias RabbitMQMessageDeduplication.Common, as: Common
 
@@ -28,8 +27,8 @@ defmodule RabbitMQMessageDeduplication.CacheManager do
     [description: "message deduplication plugin cache maintenance process",
      mfa: {:rabbit_sup, :start_child, [__MODULE__]},
      cleanup: {:rabbit_sup, :stop_child, [__MODULE__]},
-     requires: :database,
-     enables: :external_infrastructure]}
+     requires: :kernel_ready,
+     enables: :recovery]}
 
   def start_link() do
     GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
@@ -40,12 +39,15 @@ defmodule RabbitMQMessageDeduplication.CacheManager do
   """
   @spec create(atom, boolean, list) :: :ok | { :error, any }
   def create(cache, distributed, options) do
+    require Logger
+
     try do
       timeout = Common.cache_wait_time() + Timer.seconds(5)
-
       GenServer.call(__MODULE__, {:create, cache, distributed, options}, timeout)
     catch
-      :exit, {:noproc, _} -> {:error, :noproc}
+      :exit, {:noproc, info} ->
+        Logger.error("CacheManager GenServer not found! Module: #{inspect(__MODULE__)}, Info: #{inspect(info)}")
+        {:error, :noproc}
     end
   end
 
@@ -65,90 +67,144 @@ defmodule RabbitMQMessageDeduplication.CacheManager do
   Disable the cache and terminate the manager process.
   """
   def disable() do
-    {:ok, _node} = Mnesia.unsubscribe(:system)
     :ok = Supervisor.terminate_child(:rabbit_sup, __MODULE__)
     :ok = Supervisor.delete_child(:rabbit_sup, __MODULE__)
   end
 
   ## Server Callbacks
 
-  # Run Mnesia creation functions handling output
-  defmacro mnesia_create(function) do
-    quote do
-      case unquote(function) do
-        {:atomic, :ok} -> :ok
-        {:aborted, {:already_exists, _}} -> :ok
-        {:aborted, {:already_exists, _, _}} -> :ok
-        error -> error
-      end
-    end
+  # Start the cleanup routine. Registry path will be created lazily on first use.
+  def init(_state) do
+    require Logger
+    Process.send_after(self(), :cleanup, Common.cleanup_period())
+    {:ok, %{registry_ensured: false}}
   end
 
-  # Create the cache table and start the cleanup routine.
-  def init(state) do
-    Mnesia.start()
-
-    with :ok <- mnesia_create(Mnesia.create_table(caches(), [])),
-         :ok <- mnesia_create(Mnesia.add_table_copy(caches(), node(), :ram_copies)),
-         :ok <- Mnesia.wait_for_tables([caches()], Common.cache_wait_time()),
-         {:ok, _node} <- Mnesia.subscribe(:system)
-    do
-      Process.send_after(__MODULE__, :cleanup, Common.cleanup_period())
-      {:ok, state}
-    else
-      {:timeout, reason} -> {:error, reason}
-      error -> error
-    end
-  end
-
-  # Create the cache and add it to the Mnesia caches table
+  # Create the cache and add it to the registry
   def handle_call({:create, cache, distributed, options}, _from, state) do
-    function = fn -> Mnesia.write({caches(), cache, :nil}) end
+    # Ensure the registry base path exists on first use
+    state = ensure_registry_path(state)
 
-    with :ok <- Cache.create(cache, distributed, options),
-         {:atomic, result} <- Mnesia.transaction(function)
-    do
-      {:reply, result, state}
-    else
-      {:aborted, reason} -> {:reply, {:error, reason}, state}
-      error -> {:reply, error, state}
+    registry_path = cache_registry_path(cache)
+
+    case Cache.create(cache, distributed, options) do
+      :ok ->
+        case khepri_put(registry_path, %{}) do
+          {:ok, _} -> {:reply, :ok, state}
+          :ok -> {:reply, :ok, state}
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
+      error ->
+        {:reply, error, state}
     end
   end
 
-  # Drop the cache and remove it from the Mnesia caches table
+  # Drop the cache and remove it from the registry
   def handle_call({:destroy, cache}, _from, state) do
-    function = fn -> Mnesia.delete({caches(), cache}) end
+    registry_path = cache_registry_path(cache)
 
-    with :ok <- Cache.drop(cache),
-         {:atomic, result} <- Mnesia.transaction(function)
-    do
-      {:reply, result, state}
-    else
-      {:aborted, reason} -> {:reply, {:error, reason}, state}
-      error -> {:reply, error, state}
+    case Cache.drop(cache) do
+      :ok ->
+        case khepri_delete(registry_path) do
+          :ok -> {:reply, :ok, state}
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
+      error ->
+        {:reply, error, state}
     end
   end
 
   # The maintenance process deletes expired cache entries.
   def handle_info(:cleanup, state) do
-    {:atomic, caches} = Mnesia.transaction(fn -> Mnesia.all_keys(caches()) end)
-    Enum.each(caches, &Cache.delete_expired_entries/1)
-    Process.send_after(__MODULE__, :cleanup, Common.cleanup_period())
+    case khepri_get_all_caches() do
+      {:ok, caches} ->
+        Enum.each(caches, fn cache -> Cache.delete_expired_entries(cache) end)
+      _ ->
+        :ok
+    end
 
+    Process.send_after(self(), :cleanup, Common.cleanup_period())
     {:noreply, state}
   end
 
-  # On node addition distribute cache tables
-  def handle_info({:mnesia_system_event, {:mnesia_up, _node}}, state) do
-    {:atomic, caches} = Mnesia.transaction(fn -> Mnesia.all_keys(caches()) end)
-    Enum.each(caches, &Cache.rebalance_replicas/1)
-
+  def handle_info(_event, state) do
     {:noreply, state}
   end
 
-  def handle_info({:mnesia_system_event, _event}, state) do
-    {:noreply, state}
+  ## Utility functions
+
+  # Ensure the registry base path exists (lazy initialization)
+  defp ensure_registry_path(%{registry_ensured: true} = state), do: state
+  defp ensure_registry_path(%{registry_ensured: false} = state) do
+    registry_path = registry_base_path()
+    case khepri_ensure_path(registry_path) do
+      {:ok, _} -> %{state | registry_ensured: true}
+      :ok -> %{state | registry_ensured: true}
+      {:error, _} -> state  # Keep trying on next call
+    end
   end
 
-  def caches(), do: :message_deduplication_caches
+  # Khepri path helpers
+  defp registry_base_path() do
+    [:rabbitmq_message_deduplication, :cache_registry]
+  end
+
+  defp cache_registry_path(cache) do
+    [:rabbitmq_message_deduplication, :cache_registry, cache]
+  end
+
+  # Khepri wrapper functions
+  defp khepri_ensure_path(path) do
+    store_id = get_store_id()
+    case :khepri.put(store_id, path, %{}) do
+      :ok -> {:ok, :ok}
+      {:ok, result} -> {:ok, result}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp khepri_put(path, data) do
+    store_id = get_store_id()
+    case :khepri.put(store_id, path, data) do
+      :ok -> {:ok, :ok}
+      {:ok, result} -> {:ok, result}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp khepri_delete(path) do
+    store_id = get_store_id()
+    case :khepri.delete(store_id, path) do
+      :ok -> :ok
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp khepri_get_all_caches() do
+    store_id = get_store_id()
+    registry_path = registry_base_path()
+
+    case :khepri.get_many(store_id, registry_path ++ [{:if_name_matches, :any, :undefined}]) do
+      {:ok, entries} ->
+        # Extract cache names from the paths
+        cache_names = entries
+          |> Map.keys()
+          |> Enum.map(fn path -> List.last(path) end)
+        {:ok, cache_names}
+      {:error, {:node_not_found, _}} ->
+        {:ok, []}
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Get the Khepri store ID
+  # In production, use rabbit's store. In tests, use a test store.
+  defp get_store_id() do
+    case Application.get_env(:rabbitmq_message_deduplication, :khepri_store_id) do
+      nil -> :rabbitmq_metadata
+      store_id -> store_id
+    end
+  end
 end

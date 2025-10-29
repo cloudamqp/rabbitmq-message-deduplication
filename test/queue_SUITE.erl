@@ -15,21 +15,24 @@
 
 all() ->
     [
-     {group, non_parallel_tests}
+     {group, mnesia_tests},
+     {group, khepri_tests}
     ].
 
 groups() ->
+    Tests = [
+             deduplicate_message,
+             deduplicate_message_ttl,
+             deduplicate_message_confirm,
+             message_acknowledged,
+             queue_overflow,
+             dead_letter,
+             consume_no_ack,
+             queue_policy
+            ],
     [
-     {non_parallel_tests, [], [
-                               deduplicate_message,
-                               deduplicate_message_ttl,
-                               deduplicate_message_confirm,
-                               message_acknowledged,
-                               queue_overflow,
-                               dead_letter,
-                               consume_no_ack,
-                               queue_policy
-                              ]}
+     {mnesia_tests, [], Tests},
+     {khepri_tests, [], Tests}
     ].
 
 %% -------------------------------------------------------------------
@@ -49,7 +52,17 @@ end_per_suite(Config) ->
       Config, rabbit_ct_client_helpers:teardown_steps() ++
           rabbit_ct_broker_helpers:teardown_steps()).
 
-init_per_group(_, Config) -> Config.
+init_per_group(khepri_tests, Config) ->
+    Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    case rabbit_ct_broker_helpers:enable_feature_flag(Config, Servers, khepri_db) of
+        ok -> Config;
+        {skip, _} = Skip -> Skip
+    end;
+init_per_group(mnesia_tests, Config) ->
+    %% Mnesia is the default, no feature flag needed
+    Config;
+init_per_group(_, Config) ->
+    Config.
 
 end_per_group(_, Config) -> Config.
 
@@ -213,18 +226,28 @@ consume_no_ack(Config) ->
         #'basic.consume_ok'{} -> ok
     end,
 
-    publish_messages(Channel, <<"test">>, "deduplicate-this", 1),
+    %% Publish first message with unique payload
+    publish_messages(Channel, <<"test">>, "deduplicate-this", <<"first-message">>, 1),
     receive
-        {#'basic.deliver'{}, _} -> ok
+        {#'basic.deliver'{}, #amqp_msg{payload = Payload1}} ->
+            case Payload1 of
+                <<"first-message">> -> ok;
+                _ -> error({unexpected_payload, Payload1, expected, <<"first-message">>})
+            end
     after 1000 ->
-        error(message_not_received)
+        error(first_message_not_received)
     end,
 
-    publish_messages(Channel, <<"test">>, "deduplicate-this", 1),
+    %% Publish second message (duplicate header, different payload)
+    publish_messages(Channel, <<"test">>, "deduplicate-this", <<"second-message">>, 1),
     receive
-        {#'basic.deliver'{}, _} -> ok
+        {#'basic.deliver'{}, #amqp_msg{payload = Payload2}} ->
+            case Payload2 of
+                <<"second-message">> -> ok;
+                _ -> error({unexpected_payload, Payload2, expected, <<"second-message">>})
+            end
     after 1000 ->
-        error(message_not_received)
+        error(second_message_not_received)
     end.
 
 queue_policy(Config) ->
@@ -289,6 +312,7 @@ bind_new_exchange(Ch, Ex, Q) ->
     Binding = #'queue.bind'{queue = Q, exchange = Ex, routing_key = <<"#">>},
     #'queue.bind_ok'{} = amqp_channel:call(Ch, Binding).
 
+%% Publish N messages without dedup header, with default payload
 publish_messages(_Ch, _Ex, 0) ->
     ok;
 publish_messages(Ch, Ex, N) ->
@@ -297,9 +321,10 @@ publish_messages(Ch, Ex, N) ->
     amqp_channel:cast(Ch, Publish, Msg),
     publish_messages(Ch, Ex, N-1).
 
+%% Publish N messages with dedup header D, with default payload
 publish_messages(_Ch, _Ex, _D, 0) ->
     ok;
-publish_messages(Ch, Ex, D, N) ->
+publish_messages(Ch, Ex, D, N) when is_integer(N) ->
     Type = case D of
                D when is_integer(D) -> long;
                D when is_float(D) -> float;
@@ -310,14 +335,45 @@ publish_messages(Ch, Ex, D, N) ->
     Publish = #'basic.publish'{exchange = Ex, routing_key = <<"#">>},
     Msg = #amqp_msg{props = Props, payload = <<"payload">>},
     amqp_channel:cast(Ch, Publish, Msg),
-    publish_messages(Ch, Ex, D, N-1).
+    publish_messages(Ch, Ex, D, N-1);
+%% Publish N messages without dedup header, with custom Payload
+publish_messages(Ch, Ex, Payload, N) when is_binary(Payload) ->
+    Publish = #'basic.publish'{exchange = Ex, routing_key = <<"#">>},
+    Msg = #amqp_msg{payload = Payload},
+    amqp_channel:cast(Ch, Publish, Msg),
+    publish_messages(Ch, Ex, Payload, N-1).
 
+%% Publish N messages with dedup header D and expiration E, with default payload
 publish_messages(_Ch, _Ex, _D, _E, 0) ->
     ok;
-publish_messages(Ch, Ex, D, E, N) ->
+publish_messages(Ch, Ex, D, E, N) when is_list(E) ->
     Props = #'P_basic'{headers = [{<<"x-deduplication-header">>, longstr, D}],
                        expiration = E},
     Publish = #'basic.publish'{exchange = Ex, routing_key = <<"#">>},
     Msg = #amqp_msg{props = Props, payload = <<"payload">>},
     amqp_channel:cast(Ch, Publish, Msg),
-    publish_messages(Ch, Ex, D, E, N-1).
+    publish_messages(Ch, Ex, D, E, N-1);
+%% Publish N messages with dedup header D, with custom Payload
+publish_messages(Ch, Ex, D, Payload, N) when is_binary(Payload) ->
+    Type = case D of
+               D when is_integer(D) -> long;
+               D when is_float(D) -> float;
+               D when is_list(D) -> longstr;
+               undefined -> void
+           end,
+    Props = #'P_basic'{headers = [{<<"x-deduplication-header">>, Type, D}]},
+    Publish = #'basic.publish'{exchange = Ex, routing_key = <<"#">>},
+    Msg = #amqp_msg{props = Props, payload = Payload},
+    amqp_channel:cast(Ch, Publish, Msg),
+    publish_messages(Ch, Ex, D, Payload, N-1).
+
+%% Publish N messages with dedup header D, expiration E, and custom Payload
+publish_messages(_Ch, _Ex, _D, _E, _Payload, 0) ->
+    ok;
+publish_messages(Ch, Ex, D, E, Payload, N) ->
+    Props = #'P_basic'{headers = [{<<"x-deduplication-header">>, longstr, D}],
+                       expiration = E},
+    Publish = #'basic.publish'{exchange = Ex, routing_key = <<"#">>},
+    Msg = #amqp_msg{props = Props, payload = Payload},
+    amqp_channel:cast(Ch, Publish, Msg),
+    publish_messages(Ch, Ex, D, E, Payload, N-1).

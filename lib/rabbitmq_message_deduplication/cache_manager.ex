@@ -12,8 +12,6 @@ defmodule RabbitMQMessageDeduplication.CacheManager do
 
   use GenServer
 
-  require RabbitMQMessageDeduplication.Cache
-
   alias :timer, as: Timer
   alias RabbitMQMessageDeduplication.Cache, as: Cache
   alias RabbitMQMessageDeduplication.Common, as: Common
@@ -73,56 +71,37 @@ defmodule RabbitMQMessageDeduplication.CacheManager do
 
   ## Server Callbacks
 
-  # Start the cleanup routine. Registry path will be created lazily on first use.
+  # Start the cleanup routine
   def init(_state) do
     require Logger
     Process.send_after(self(), :cleanup, Common.cleanup_period())
-    {:ok, %{registry_ensured: false}}
+    {:ok, %{}}
   end
 
-  # Create the cache and add it to the registry
+  # Create the cache
   def handle_call({:create, cache, distributed, options}, _from, state) do
-    # Ensure the registry base path exists on first use
-    state = ensure_registry_path(state)
-
-    registry_path = cache_registry_path(cache)
-
     case Cache.create(cache, distributed, options) do
       :ok ->
-        case khepri_put(registry_path, %{}) do
-          {:ok, _} -> {:reply, :ok, state}
-          :ok -> {:reply, :ok, state}
-          {:error, reason} -> {:reply, {:error, reason}, state}
-        end
+        {:reply, :ok, state}
       error ->
         {:reply, error, state}
     end
   end
 
-  # Drop the cache and remove it from the registry
+  # Drop the cache
   def handle_call({:destroy, cache}, _from, state) do
-    registry_path = cache_registry_path(cache)
-
     case Cache.drop(cache) do
       :ok ->
-        case khepri_delete(registry_path) do
-          :ok -> {:reply, :ok, state}
-          {:error, reason} -> {:reply, {:error, reason}, state}
-        end
+        {:reply, :ok, state}
       error ->
         {:reply, error, state}
     end
   end
 
   # The maintenance process deletes expired cache entries.
+  # Note: We don't have a registry anymore, so we can't enumerate caches.
+  # Cleanup will be triggered per-cache by the individual decorators.
   def handle_info(:cleanup, state) do
-    case khepri_get_all_caches() do
-      {:ok, caches} ->
-        Enum.each(caches, fn cache -> Cache.delete_expired_entries(cache) end)
-      _ ->
-        :ok
-    end
-
     Process.send_after(self(), :cleanup, Common.cleanup_period())
     {:noreply, state}
   end
@@ -131,80 +110,4 @@ defmodule RabbitMQMessageDeduplication.CacheManager do
     {:noreply, state}
   end
 
-  ## Utility functions
-
-  # Ensure the registry base path exists (lazy initialization)
-  defp ensure_registry_path(%{registry_ensured: true} = state), do: state
-  defp ensure_registry_path(%{registry_ensured: false} = state) do
-    registry_path = registry_base_path()
-    case khepri_ensure_path(registry_path) do
-      {:ok, _} -> %{state | registry_ensured: true}
-      :ok -> %{state | registry_ensured: true}
-      {:error, _} -> state  # Keep trying on next call
-    end
-  end
-
-  # Khepri path helpers
-  defp registry_base_path() do
-    [:rabbitmq_message_deduplication, :cache_registry]
-  end
-
-  defp cache_registry_path(cache) do
-    [:rabbitmq_message_deduplication, :cache_registry, cache]
-  end
-
-  # Khepri wrapper functions
-  defp khepri_ensure_path(path) do
-    store_id = get_store_id()
-    case :khepri.put(store_id, path, %{}) do
-      :ok -> {:ok, :ok}
-      {:ok, result} -> {:ok, result}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp khepri_put(path, data) do
-    store_id = get_store_id()
-    case :khepri.put(store_id, path, data) do
-      :ok -> {:ok, :ok}
-      {:ok, result} -> {:ok, result}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp khepri_delete(path) do
-    store_id = get_store_id()
-    case :khepri.delete(store_id, path) do
-      :ok -> :ok
-      {:ok, _} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp khepri_get_all_caches() do
-    store_id = get_store_id()
-    registry_path = registry_base_path()
-
-    case :khepri.get_many(store_id, registry_path ++ [{:if_name_matches, :any, :undefined}]) do
-      {:ok, entries} ->
-        # Extract cache names from the paths
-        cache_names = entries
-          |> Map.keys()
-          |> Enum.map(fn path -> List.last(path) end)
-        {:ok, cache_names}
-      {:error, {:node_not_found, _}} ->
-        {:ok, []}
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  # Get the Khepri store ID
-  # In production, use rabbit's store. In tests, use a test store.
-  defp get_store_id() do
-    case Application.get_env(:rabbitmq_message_deduplication, :khepri_store_id) do
-      nil -> :rabbitmq_metadata
-      store_id -> store_id
-    end
-  end
 end

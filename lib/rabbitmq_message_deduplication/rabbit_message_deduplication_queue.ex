@@ -188,6 +188,9 @@ defmodule RabbitMQMessageDeduplication.Queue do
   @impl :rabbit_backing_queue
   def publish(message, properties, boolean, pid,
               state = dqstate(queue: queue, queue_state: qs)) do
+    require Logger
+    header = Common.message_header(message, @dedup_header)
+    Logger.warning("PUBLISH called (4-arg), header=#{inspect(header)}, queue=#{inspect(AMQQueue.get_name(queue))}")
     maybe_insert_cache_entry(message, queue, state)
     passthrough1(state) do
       publish(message, properties, boolean, pid, qs)
@@ -196,6 +199,9 @@ defmodule RabbitMQMessageDeduplication.Queue do
   # v3.13.x
   def publish(message, properties, boolean, pid, flow,
               state = dqstate(queue: queue, queue_state: qs)) do
+    require Logger
+    header = Common.message_header(message, @dedup_header)
+    Logger.warning("PUBLISH called (5-arg), header=#{inspect(header)}, queue=#{inspect(AMQQueue.get_name(queue))}")
     maybe_insert_cache_entry(message, queue, state)
     passthrough1(state) do
       publish(message, properties, boolean, pid, flow, qs)
@@ -206,7 +212,10 @@ defmodule RabbitMQMessageDeduplication.Queue do
   # is delivered straight to the client. Acknowledgement is enabled.
   @impl :rabbit_backing_queue
   def publish_delivered(message, properties, pid, state) do
+    require Logger
     dqstate(queue: queue, queue_state: qs) = state
+    header = Common.message_header(message, @dedup_header)
+    Logger.warning("PUBLISH_DELIVERED called, header=#{inspect(header)}, queue=#{inspect(AMQQueue.get_name(queue))}")
 
     maybe_insert_cache_entry(message, queue, state)
 
@@ -240,11 +249,16 @@ defmodule RabbitMQMessageDeduplication.Queue do
   end
 
   @impl :rabbit_backing_queue
-  def discard(message, pid, state = dqstate(queue_state: qs)) do
+  def discard(message, pid, state = dqstate(queue: queue, queue_state: qs)) do
+    require Logger
+    header = Common.message_header(message, @dedup_header)
+    Logger.warning("DISCARD called (2-arg), header=#{inspect(header)}, queue=#{inspect(AMQQueue.get_name(queue))}")
     passthrough1(state, do: discard(message, pid, qs))
   end
   # v3.13.x
-  def discard(msg_id, pid, flow, state = dqstate(queue_state: qs)) do
+  def discard(msg_id, pid, flow, state = dqstate(queue: queue, queue_state: qs)) do
+    require Logger
+    Logger.warning("DISCARD called (3-arg), msg_id=#{inspect(msg_id)}, queue=#{inspect(AMQQueue.get_name(queue))}")
     passthrough1(state, do: discard(msg_id, pid, flow, qs))
   end
 
@@ -309,8 +323,11 @@ defmodule RabbitMQMessageDeduplication.Queue do
 
   @impl :rabbit_backing_queue
   def ack(acks = [dqack() | _], state) do
+    require Logger
+    Logger.warning("ACK called with dqack, count=#{length(acks)}")
     dqstate(queue: queue, queue_state: qs) = state
     acks = Enum.map(acks, fn(dqack(tag: ack_tag, header: header)) ->
+                            Logger.warning("  Deleting cache entry for header=#{inspect(header)}")
                             maybe_delete_cache_entry(queue, header)
                             ack_tag
                           end)
@@ -320,6 +337,8 @@ defmodule RabbitMQMessageDeduplication.Queue do
 
   @impl :rabbit_backing_queue
   def ack(acks, state = dqstate(queue_state: qs)) do
+    require Logger
+    Logger.warning("ACK called without dqack, count=#{length(acks)}")
     passthrough2(state, do: ack(acks, qs))
   end
 
@@ -431,10 +450,16 @@ defmodule RabbitMQMessageDeduplication.Queue do
 
   @impl :rabbit_backing_queue
   def is_duplicate(message, state = dqstate(queue: queue, queue_state: qs)) do
+    require Logger
     case passthrough2(state, do: is_duplicate(message, qs)) do
-      {true, state} -> {true, state}
+      {true, state} ->
+        Logger.warning("IS_DUPLICATE: passthrough said true")
+        {true, state}
       {false, state} -> if dedup_queue?(state) do
-                          {duplicate?(queue, message), state}
+                          dup = duplicate?(queue, message)
+                          header = Common.message_header(message, @dedup_header)
+                          Logger.warning("IS_DUPLICATE: header=#{inspect(header)}, result=#{dup}, queue=#{inspect(AMQQueue.get_name(queue))}")
+                          {dup, state}
                         else
                           {false, state}
                         end
@@ -568,27 +593,41 @@ defmodule RabbitMQMessageDeduplication.Queue do
 
   # Insert message header in the cache
   defp maybe_insert_cache_entry(message, queue, state) do
+    require Logger
     with true <- dedup_queue?(state),
          key when not is_nil(key) <- Common.message_header(message, @dedup_header)
     do
       cache = queue |> AMQQueue.get_name() |> Common.cache_name()
+      queue_name = AMQQueue.get_name(queue)
+      Logger.warning("MAYBE_INSERT: key=#{inspect(key)}, queue=#{inspect(queue_name)}, cache=#{inspect(cache)}, message #{inspect(message)}")
       case Cache.insert(cache, key, message_expiration(message)) do
-        {:ok, _} -> :ok
-        {:error, _reason} -> :ok  # Cache not available, ignore error
+        {:ok, result} ->
+          Logger.warning("MAYBE_INSERT: result=#{inspect(result)}")
+          :ok
+        {:error, reason} ->
+          Logger.warning("MAYBE_INSERT: error=#{inspect(reason)}")
+          :ok  # Cache not available, ignore error
       end
     end
   end
 
   # Returns true if the message is a duplicate.
   defp duplicate?(queue, message) do
+    require Logger
     cache = queue |> AMQQueue.get_name() |> Common.cache_name()
+    queue_name = AMQQueue.get_name(queue)
 
     case Common.message_header(message, @dedup_header) do
       nil -> false
       key ->
+        Logger.warning("DUPLICATE?: checking key=#{inspect(key)}, cache=#{inspect(cache)}, queue=#{inspect(queue_name)}")
         case Cache.exists?(cache, key) do
-          {:ok, exists?} -> exists?
-          {:error, _} -> false  # Cache not available, assume not duplicate
+          {:ok, exists?} ->
+            Logger.warning("DUPLICATE?: key=#{inspect(key)}, exists=#{exists?}")
+            exists?
+          {:error, reason} ->
+            Logger.warning("DUPLICATE?: key=#{inspect(key)}, error=#{inspect(reason)}")
+            false  # Cache not available, assume not duplicate
         end
     end
   end

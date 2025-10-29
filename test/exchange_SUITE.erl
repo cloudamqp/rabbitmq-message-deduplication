@@ -15,19 +15,22 @@
 
 all() ->
     [
-     {group, non_parallel_tests}
+     {group, mnesia_tests},
+     {group, khepri_tests}
     ].
 
 groups() ->
+    Tests = [
+             disable_enable,
+             declare_exchanges,
+             deduplicate_message,
+             deduplicate_message_ttl,
+             deduplicate_message_cache_overflow,
+             exchange_policy
+            ],
     [
-     {non_parallel_tests, [], [
-                               disable_enable,
-                               declare_exchanges,
-                               deduplicate_message,
-                               deduplicate_message_ttl,
-                               deduplicate_message_cache_overflow,
-                               exchange_policy
-                              ]}
+     {mnesia_tests, [], Tests},
+     {khepri_tests, [], Tests}
     ].
 
 %% -------------------------------------------------------------------
@@ -47,7 +50,17 @@ end_per_suite(Config) ->
       Config, rabbit_ct_client_helpers:teardown_steps() ++
           rabbit_ct_broker_helpers:teardown_steps()).
 
-init_per_group(_, Config) -> Config.
+init_per_group(khepri_tests, Config) ->
+    Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    case rabbit_ct_broker_helpers:enable_feature_flag(Config, Servers, khepri_db) of
+        ok -> Config;
+        {skip, _} = Skip -> Skip
+    end;
+init_per_group(mnesia_tests, Config) ->
+    %% Mnesia is the default, no feature flag needed
+    Config;
+init_per_group(_, Config) ->
+    Config.
 
 end_per_group(_, Config) -> Config.
 

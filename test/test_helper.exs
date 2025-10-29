@@ -32,4 +32,8 @@ end
 # Configure the application to use the test store
 Application.put_env(:rabbitmq_message_deduplication, :khepri_store_id, store_id)
 
+# Force rabbit_khepri to use Khepri backend in tests
+# Use persistent_term directly since the function may not be exported
+:persistent_term.put({:rabbit_khepri, :forced_metadata_store}, :khepri)
+
 ExUnit.start()

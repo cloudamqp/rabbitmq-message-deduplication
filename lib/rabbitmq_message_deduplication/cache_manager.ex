@@ -129,10 +129,11 @@ defmodule RabbitMQMessageDeduplication.CacheManager do
     end
   end
 
-  # The maintenance process deletes expired cache entries.
+  # The maintenance process deletes expired cache entries and enforces size limits.
   def handle_info(:cleanup, state) do
     {:atomic, caches} = Mnesia.transaction(fn -> Mnesia.all_keys(caches()) end)
     Enum.each(caches, &Cache.delete_expired_entries/1)
+    Enum.each(caches, &Cache.enforce_size_limit/1)
     Process.send_after(__MODULE__, :cleanup, Common.cleanup_period())
 
     {:noreply, state}

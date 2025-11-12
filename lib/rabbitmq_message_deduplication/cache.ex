@@ -136,6 +136,44 @@ defmodule RabbitMQMessageDeduplication.Cache do
   end
 
   @doc """
+  Enforce the cache size limit by removing random entries if the cache exceeds its configured size.
+  """
+  @spec enforce_size_limit(atom) :: :ok | { :error, any }
+  def enforce_size_limit(cache) do
+    case cache_property(cache, :size) do
+      nil -> :ok
+      configured_size ->
+        current_size = Mnesia.table_info(cache, :size)
+        excess = current_size - configured_size
+
+        if excess > 0 do
+          delete_random_entries(cache, excess)
+        else
+          :ok
+        end
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  # Delete N random entries from the cache
+  defp delete_random_entries(cache, count) do
+    delete_fn = fn ->
+      Enum.each(1..count, fn _ ->
+        case Mnesia.first(cache) do
+          :"$end_of_table" -> :ok
+          key -> Mnesia.delete({cache, key})
+        end
+      end)
+    end
+
+    case Mnesia.transaction(delete_fn) do
+      {:atomic, :ok} -> :ok
+      {:aborted, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
   Return information related to the given cache.
   """
   @spec info(atom) :: list

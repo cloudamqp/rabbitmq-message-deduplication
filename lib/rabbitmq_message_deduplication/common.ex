@@ -75,10 +75,14 @@ defmodule RabbitMQMessageDeduplication.Common do
     cache = cache_name(name)
 
     case message_header(message, "x-deduplication-header") do
-      key when not is_nil(key) -> case Cache.insert(cache, key, ttl) do
-                                    {:ok, :exists} -> true
-                                    {:ok, :inserted} -> false
-                                  end
+      key when not is_nil(key) ->
+	# the key header value might reference a larger binary of the
+	# original raw AMQP frame
+	key = if is_binary(key) do :binary.copy(key) else key end
+	case Cache.insert(cache, key, ttl) do
+          {:ok, :exists} -> true
+          {:ok, :inserted} -> false
+        end
       nil -> false
     end
   end

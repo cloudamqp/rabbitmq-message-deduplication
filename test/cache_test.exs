@@ -11,8 +11,10 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
   alias :timer, as: Timer
   alias :mnesia, as: Mnesia
   alias RabbitMQMessageDeduplication.Cache, as: Cache
+  import RabbitMQMessageDeduplication.FeatureFlagHelpers
 
-  setup do
+  # Shared setup for creating test caches
+  defp setup_caches do
     cache = :test_cache
     cache_ttl = :test_cache_ttl
     cache_simple = :cache_simple
@@ -21,6 +23,7 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
       Mnesia.delete_table(cache)
       Mnesia.delete_table(cache_ttl)
       Mnesia.delete_table(cache_simple)
+      cleanup_mocks()
     end
 
     cache_simple_options = [persistence: :memory]
@@ -34,7 +37,17 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
     %{cache: cache, cache_ttl: cache_ttl, cache_simple: cache_simple}
   end
 
-  test "basic insertion",
+  # Tests with Mnesia backend (khepri_db disabled)
+  describe "with Mnesia backend" do
+    setup do
+      # Ensure khepri_db is disabled for Mnesia tests
+      case ensure_mnesia_backend() do
+        :ok -> setup_caches()
+        skip -> skip
+      end
+    end
+
+    test "basic insertion",
       %{cache: cache, cache_ttl: _, cache_simple: _} do
     {:ok, :inserted} = Cache.insert(cache, "foo")
     {:ok, :exists} = Cache.insert(cache, "foo")
@@ -73,7 +86,9 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
 
     :ok = Cache.delete_expired_entries(cache)
 
-    {:atomic, []} = Mnesia.transaction(fn -> Mnesia.all_keys(cache) end)
+    # Backend-agnostic check: verify cache is empty
+    info = Cache.info(cache)
+    assert Keyword.get(info, :entries) == 0
   end
 
   test "entries are deleted if cache is full",
@@ -132,20 +147,143 @@ defmodule RabbitMQMessageDeduplication.Cache.Test do
     {:error, {:invalid, :wrong_key}} = Cache.change_option(cache, :wrong_key, 10)
   end
 
-  test "reconfigure old cache on creation", %{cache: cache, cache_ttl: _, cache_simple: _} do
-    Mnesia.delete_table_property(cache, :distributed)
-    Mnesia.delete_table_property(cache, :size)
-    Mnesia.delete_table_property(cache, :ttl)
+    test "reconfigure old cache on creation", %{cache: cache, cache_ttl: _, cache_simple: _} do
+      Mnesia.delete_table_property(cache, :distributed)
+      Mnesia.delete_table_property(cache, :size)
+      Mnesia.delete_table_property(cache, :ttl)
 
-    Mnesia.write_table_property(cache, {:limit, 100})
-    Mnesia.write_table_property(cache, {:default_ttl, 100})
+      Mnesia.write_table_property(cache, {:limit, 100})
+      Mnesia.write_table_property(cache, {:default_ttl, 100})
 
-    cache_options = [size: 1, ttl: nil, persistence: :memory]
+      cache_options = [size: 1, ttl: nil, persistence: :memory]
 
-    Cache.create(cache, true, cache_options)
+      Cache.create(cache, true, cache_options)
 
-    {:ttl, 100} = Mnesia.read_table_property(cache, :ttl)
-    {:size, 100} = Mnesia.read_table_property(cache, :size)
-    {:distributed, true} = Mnesia.read_table_property(cache, :distributed)
+      {:ttl, 100} = Mnesia.read_table_property(cache, :ttl)
+      {:size, 100} = Mnesia.read_table_property(cache, :size)
+      {:distributed, true} = Mnesia.read_table_property(cache, :distributed)
+    end
+  end
+
+  # Tests with Khepri backend (khepri_db enabled)
+  describe "with Khepri backend" do
+    setup do
+      # Enable khepri_db feature flag for Khepri tests
+      case ensure_khepri_backend() do
+        :ok ->
+          # Wait for feature flag to stabilize
+          :ok = wait_for_stable_state()
+          setup_caches()
+
+        {:error, reason} ->
+          {:skip, "Failed to enable khepri_db: #{inspect(reason)}"}
+      end
+    end
+
+    test "basic insertion",
+        %{cache: cache, cache_ttl: _, cache_simple: _} do
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+      {:ok, :exists} = Cache.insert(cache, "foo")
+    end
+
+    test "TTL at insertion",
+        %{cache: cache, cache_ttl: _, cache_simple: _} do
+      {:ok, :inserted} = Cache.insert(cache, "foo", Timer.seconds(1))
+      {:ok, :exists} = Cache.insert(cache, "foo")
+
+      1 |> Timer.seconds() |> Timer.sleep()
+
+      :ok = Cache.delete_expired_entries(cache)
+
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+    end
+
+    test "TTL at table creation",
+        %{cache: _, cache_ttl: cache, cache_simple: _} do
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+      {:ok, :exists} = Cache.insert(cache, "foo")
+
+      1 |> Timer.seconds() |> Timer.sleep()
+
+      :ok = Cache.delete_expired_entries(cache)
+
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+    end
+
+    test "entries are deleted after TTL",
+        %{cache: cache, cache_ttl: _, cache_simple: _} do
+      {:ok, :inserted} = Cache.insert(cache, "foo", Timer.seconds(1))
+      {:ok, :exists} = Cache.insert(cache, "foo")
+
+      Timer.sleep(1200)
+
+      :ok = Cache.delete_expired_entries(cache)
+
+      # Backend-agnostic check: verify cache is empty
+      info = Cache.info(cache)
+      assert Keyword.get(info, :entries) == 0
+    end
+
+    test "entries are deleted if cache is full",
+        %{cache: cache, cache_ttl: _, cache_simple: _} do
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+      {:ok, :exists} = Cache.insert(cache, "foo")
+      {:ok, :inserted} = Cache.insert(cache, "bar")
+      {:ok, :exists} = Cache.insert(cache, "bar")
+
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+    end
+
+    test "cache entry deletion", %{cache: cache, cache_ttl: _, cache_simple: _} do
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+      {:ok, :exists} = Cache.insert(cache, "foo")
+
+      Cache.delete(cache, "foo")
+
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+    end
+
+    test "cache information",
+        %{cache: cache, cache_ttl: _, cache_simple: _} do
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+
+      [entries: 1, bytes: _, nodes: _, size: 1] = Cache.info(cache)
+    end
+
+    test "simple cache information",
+        %{cache: _, cache_ttl: _, cache_simple: cache_simple} do
+      {:ok, :inserted} = Cache.insert(cache_simple, "foo")
+
+      [entries: 1, bytes: _, nodes: _] = Cache.info(cache_simple)
+    end
+
+    test "flush the cache", %{cache: cache, cache_ttl: _, cache_simple: _} do
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+      {:ok, :exists} = Cache.insert(cache, "foo")
+
+      :ok = Cache.flush(cache)
+
+      {:ok, :inserted} = Cache.insert(cache, "foo")
+    end
+
+    test "drop the cache", %{cache: cache, cache_ttl: _, cache_simple: _} do
+      :ok = Cache.drop(cache)
+
+      # Note: Direct Mnesia check - will need backend-agnostic verification in Phase 3
+      # For now, this will fail with Khepri (expected in TDD approach)
+      assert Enum.member?(Mnesia.system_info(:tables), cache) == false
+    end
+
+    test "reconfigure the cache", %{cache: cache, cache_ttl: _, cache_simple: _} do
+      :ok = Cache.change_option(cache, :size, 10)
+
+      [entries: _, bytes: _, nodes: _, size: 10] = Cache.info(cache)
+
+      {:error, {:invalid, :wrong_key}} = Cache.change_option(cache, :wrong_key, 10)
+    end
+
+    # Note: Skipping "reconfigure old cache on creation" test for Khepri
+    # This test is Mnesia-specific (uses Mnesia.write_table_property)
+    # and tests backward compatibility with pre-0.6.0 caches
   end
 end

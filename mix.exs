@@ -9,9 +9,14 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Mixfile do
       start_permanent: Mix.env == :prod,
       deps: deps(),
       deps_path: System.get_env("DEPS_DIR", "deps"),
+      elixirc_paths: elixirc_paths(Mix.env()),
       aliases: aliases()
     ]
   end
+
+  # Specifies which paths to compile per environment
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   def application() do
     [
@@ -29,7 +34,10 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Mixfile do
 
   defp deps() do
     [
-      {:mix_task_archive_deps, github: "rabbitmq/mix_task_archive_deps", runtime: false}
+      {:mix_task_archive_deps, github: "rabbitmq/mix_task_archive_deps", runtime: false},
+      {:rabbit_common, path: System.get_env("HOME") <> "/rabbitmq-server/deps/rabbit_common", app: false, compile: false, optional: true},
+      {:rabbit, path: System.get_env("HOME") <> "/rabbitmq-server/deps/rabbit", app: false, compile: false, optional: true},
+      {:meck, "~> 0.9.2", only: :test}
     ]
   end
 

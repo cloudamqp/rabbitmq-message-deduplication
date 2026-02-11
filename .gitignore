@@ -9,3 +9,9 @@ plugins
 GPATH
 GRTAGS
 GTAGS
+ebin/
+escript/
+sbin/
+*.d
+*.ez
+erl_crash.dump

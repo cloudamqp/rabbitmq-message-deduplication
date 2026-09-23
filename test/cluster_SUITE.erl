@@ -228,7 +228,7 @@ make_exchange(Ex) ->
                     {<<"x-cache-ttl">>, long, 60000}]}.
 
 bind_new_queue(Ch, Ex, Q) ->
-    Queue = #'queue.declare'{queue = Q, auto_delete = false},
+    Queue = #'queue.declare'{queue = Q, durable = true},
     #'queue.declare_ok'{} = amqp_channel:call(Ch, Queue),
 
     Binding = #'queue.bind'{queue = Q, exchange = Ex, routing_key = <<"#">>},

@@ -240,8 +240,7 @@ queue_policy(Config) ->
 
     rabbit_ct_broker_helpers:set_policy(Config, 0, <<"policy-test">>,
         <<".*">>, <<"all">>, [{<<"x-message-deduplication">>, true}]),
-    %% Wait for policy propagation
-    timer:sleep(1000),
+    await_queue_deduplication(Config, <<"test">>, true),
 
     publish_messages(Channel, <<"test">>, "deduplicate-this", 2),
     Get = #'basic.get'{queue = <<"test">>},
@@ -264,6 +263,7 @@ queue_policy(Config) ->
 
     % Policy is cleared, default arguments are restored
     rabbit_ct_broker_helpers:clear_policy(Config, 0, <<"policy-test">>),
+    await_queue_deduplication(Config, <<"test">>, false),
 
     publish_messages(Channel, <<"test">>, "deduplicate-this", 2),
     Get = #'basic.get'{queue = <<"test">>},
@@ -276,6 +276,24 @@ queue_policy(Config) ->
 %% -------------------------------------------------------------------
 %% Utility functions.
 %% -------------------------------------------------------------------
+
+%% Policies reach the queues asynchronously: wait until the queue has
+%% deduplication enabled, or disabled, as the policy says.
+await_queue_deduplication(Config, Queue, Enabled) ->
+    rabbit_ct_helpers:await_condition(
+      fun() -> queue_deduplication(Config, Queue) =:= Enabled end).
+
+%% A queue reports the status of its deduplication cache only while
+%% deduplication is enabled.
+queue_deduplication(Config, Queue) ->
+    Name = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_misc, r,
+                                        [<<"/">>, queue, Queue]),
+    {ok, Q} = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue, lookup,
+                                           [Name]),
+    [{backing_queue_status, Status}] =
+        rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue, info,
+                                     [Q, [backing_queue_status]]),
+    lists:keymember(message_deduplication_cache_info, 1, Status).
 
 make_queue(Q) ->
     #'queue.declare'{

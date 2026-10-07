@@ -60,17 +60,23 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     Config.
 
-%% Each group starts its own cluster. The brokers are started with every plugin
-%% disabled so that the plugin can be enabled at the point each group needs it,
-%% rather than at boot.
+%% Each group starts its own cluster. Where the plugin is enabled on a running
+%% cluster, the brokers are started with every plugin disabled so that the
+%% plugin can be enabled at the point the group needs it, rather than at boot.
+%%
+%% Clustering restarts the nodes. A node with the plugin enabled loads it on
+%% every boot, so the brokers which are clustered afterwards are started with
+%% the plugin already enabled. Enabling it at runtime instead does not survive
+%% the restart on every broker version: RabbitMQ 4.2 boots the node again
+%% without it, which is not what a node with the plugin enabled does.
 init_per_group(Group, Config) ->
-    Clustered = Group =/= plugin_enabled_before_clustering,
+    BeforeClustering = Group =:= plugin_enabled_before_clustering,
     Config1 = rabbit_ct_helpers:set_config(
                 Config,
                 [{rmq_nodename_suffix, Group},
                  {rmq_nodes_count, ?NODES},
-                 {rmq_nodes_clustered, Clustered},
-                 {start_rmq_with_plugins_disabled, true}]),
+                 {rmq_nodes_clustered, not BeforeClustering},
+                 {start_rmq_with_plugins_disabled, not BeforeClustering}]),
     rabbit_ct_helpers:run_setup_steps(
       Config1,
       rabbit_ct_broker_helpers:setup_steps() ++
@@ -116,7 +122,7 @@ cluster_nodes_with_plugin_enabled(Config) ->
         false ->
             {skip, "Khepri is not the metadata store on this broker"};
         true ->
-            ok = enable_plugin_everywhere(Config),
+            ok = assert_plugin_running(Config),
             ok = cluster_nodes(Config),
 
             ok = assert_nodes_running(Config),
@@ -202,6 +208,18 @@ assert_deduplicates_across_nodes(Config) ->
     ?assertMatch(#'basic.get_empty'{}, amqp_channel:call(Channel0, Get),
                  "the duplicate published through the second node was routed, "
                  "the deduplication cache is not shared across the cluster"),
+    ok.
+
+assert_plugin_running(Config) ->
+    lists:foreach(
+      fun(N) ->
+              Apps = rabbit_ct_broker_helpers:rpc(
+                       Config, N, application, which_applications, []),
+              ?assert(lists:keymember(?PLUGIN, 1, Apps),
+                      lists:flatten(
+                        io_lib:format("the plugin is not running on node ~b",
+                                      [N])))
+      end, node_indices()),
     ok.
 
 assert_clustered(Config) ->

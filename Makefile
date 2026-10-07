@@ -1,13 +1,5 @@
 PROJECT = rabbitmq_message_deduplication
 
-define PROJECT_ENV
-[
-	{log_interval, 90000},
-	{cache_wait_time, 30000},
-	{cache_maintenance_period, 3000}
-]
-endef
-
 RABBITMQ_VERSION ?= v4.3.x
 current_rmq_ref = $(RABBITMQ_VERSION)
 
@@ -43,3 +35,9 @@ clean::
 
 include rabbitmq-components.mk
 include erlang.mk
+
+# Mix builds the application. Replace the .app file and modules erlang.mk put in
+# `ebin` with the ones Mix built, which the distribution ships, so that the tests
+# run the very same application. Runs after the `app` target of erlang.mk.
+app::
+	$(verbose) cp -a _build/$(MIX_ENV)/lib/$(PROJECT)/ebin/. ebin/

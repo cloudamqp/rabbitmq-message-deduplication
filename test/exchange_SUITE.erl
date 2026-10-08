@@ -13,6 +13,10 @@
 
 -compile(export_all).
 
+-define(PLUGIN, rabbitmq_message_deduplication).
+-define(QUEUE, 'Elixir.RabbitMQMessageDeduplication.Queue').
+-define(POLICY_EVENT, 'Elixir.RabbitMQMessageDeduplication.PolicyEvent').
+
 all() ->
     [
      {group, non_parallel_tests}
@@ -22,6 +26,7 @@ groups() ->
     [
      {non_parallel_tests, [], [
                                disable_enable,
+                               disable_restores_broker,
                                declare_exchanges,
                                deduplicate_message,
                                deduplicate_message_ttl,
@@ -75,6 +80,22 @@ end_per_testcase(Testcase, Config) ->
 disable_enable(Config) ->
     ok = rabbit_ct_broker_helpers:disable_plugin(Config, 0, rabbitmq_message_deduplication),
     ok = rabbit_ct_broker_helpers:enable_plugin(Config, 0, rabbitmq_message_deduplication).
+
+%% Disabling the plugin hands the queues back to the original backing queue
+%% and stops listening to the policy events of the broker.
+disable_restores_broker(Config) ->
+    ?assertEqual({ok, ?QUEUE}, backing_queue(Config)),
+    ?assert(lists:member(?POLICY_EVENT, event_handlers(Config))),
+
+    ok = rabbit_ct_broker_helpers:disable_plugin(Config, 0, ?PLUGIN),
+
+    ?assertNotEqual({ok, ?QUEUE}, backing_queue(Config)),
+    ?assertNot(lists:member(?POLICY_EVENT, event_handlers(Config))),
+
+    ok = rabbit_ct_broker_helpers:enable_plugin(Config, 0, ?PLUGIN),
+
+    ?assertEqual({ok, ?QUEUE}, backing_queue(Config)),
+    ?assert(lists:member(?POLICY_EVENT, event_handlers(Config))).
 
 declare_exchanges(Config) ->
     Channel = rabbit_ct_client_helpers:open_channel(Config),
@@ -210,6 +231,14 @@ exchange_policy(Config) ->
 %% -------------------------------------------------------------------
 %% Utility functions.
 %% -------------------------------------------------------------------
+
+backing_queue(Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, application, get_env,
+                                 [rabbit, backing_queue_module]).
+
+event_handlers(Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, gen_event, which_handlers,
+                                 [rabbit_event]).
 
 make_exchange(Ex, Size, TTL) ->
     #'exchange.declare'{

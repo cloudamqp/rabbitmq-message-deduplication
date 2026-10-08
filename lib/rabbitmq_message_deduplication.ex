@@ -19,8 +19,23 @@ defmodule RabbitMQMessageDeduplication do
   @impl true
   def stop(_) do
     RabbitMQMessageDeduplication.Exchange.unregister()
-    RabbitMQMessageDeduplication.Queue.disable()
     RabbitMQMessageDeduplication.PolicyEvent.disable()
+    restore_backing_queue()
+  end
+
+  # Restoring the backing queue changes the environment of the `rabbit`
+  # application, a request served by the application controller. The controller
+  # is busy stopping this application until this callback returns, so making
+  # the request from here would block until it times out. It is made from a
+  # separate process instead, and served as soon as the application stopped.
+  #
+  # Once the application stopped, its master kills every process the
+  # application left behind, which is why the process is moved out of it.
+  defp restore_backing_queue() do
+    pid = spawn(&RabbitMQMessageDeduplication.Queue.disable/0)
+    Process.group_leader(pid, Process.whereis(:init))
+
+    :ok
   end
 
   def init([]) do
